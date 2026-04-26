@@ -1,0 +1,444 @@
+# ============================================================================
+# ExpertAmateur Radiant Thermostat — Zone 1 (Cheap Yellow Display build)
+# ----------------------------------------------------------------------------
+# Target hardware: ESP32-2432S028R ("CYD") — all-in-one board with:
+#   - ESP32-WROOM-32
+#   - 2.8" ILI9341 TFT 240x320 SPI display
+#   - XPT2046 resistive touch controller (separate SPI bus)
+#   - Built-in RGB status LED (used here for heat-call visual feedback)
+#   - USB-C or Micro-USB programming/power
+#
+# External components:
+#   - DHT22 / AM2302 sensor on GPIO27
+#   - 2-channel optoisolated relay board, channel 1 on GPIO22 (active LOW)
+#   - 24VAC -> 5VDC buck converter feeding the board's 5V input
+#
+# Target system: Taco SR501 switching relay, Zone 1 (Hood River house)
+#
+# Notes:
+#   - CYD uses two separate SPI buses for display and touch. Don't combine them.
+#   - GPIO 2, 12, 15 are strapping pins; warnings are suppressed because the
+#     CYD hardware design uses them intentionally and works correctly.
+#   - Free GPIOs available on the extended connector: 22, 27, 35 (input only),
+#     plus TX/RX. We use 22 + 27.
+#   - Pinout from the Home Assistant community CYD config thread (Ryan Ewen).
+# ============================================================================
+
+substitutions:
+  device_name: "radiant-zone1"
+  friendly_name: "Radiant Zone 1"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -10
+    then:
+      - lambda: 'ESP_LOGI("boot", "Radiant Zone 1 (CYD) starting up");'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ----------------------------------------------------------------------------
+# Network
+# ----------------------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Radiant-Zone1-Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+logger:
+  level: INFO
+  logs:
+    component: WARN
+    display: WARN
+    touchscreen: WARN
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+
+# ----------------------------------------------------------------------------
+# SPI — CYD uses two separate buses
+#   tft_spi: drives the ILI9341 display (HSPI pins)
+#   touch_spi: drives the XPT2046 touch controller (VSPI pins)
+# ----------------------------------------------------------------------------
+spi:
+  - id: tft_spi
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin:
+      number: GPIO12
+      ignore_strapping_warning: true
+  - id: touch_spi
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+# ----------------------------------------------------------------------------
+# I2C — available on the extended connector for future expansion (BME280,
+# SHT40, etc.). Not used in this prototype but configured so the bus is ready.
+# ----------------------------------------------------------------------------
+i2c:
+  sda: GPIO27   # shared with DHT22 if we ever swap sensors
+  scl: GPIO22   # shared with relay GPIO below — don't enable both I2C and relay
+  scan: false
+
+# ----------------------------------------------------------------------------
+# Backlight PWM (GPIO21) and RGB status LED (GPIO 4/16/17, active LOW)
+# ----------------------------------------------------------------------------
+output:
+  - id: backlight_pwm
+    platform: ledc
+    pin: GPIO21
+    frequency: 1000 Hz
+
+  - id: rgb_red
+    platform: ledc
+    pin: GPIO4
+    inverted: true
+  - id: rgb_green
+    platform: ledc
+    pin: GPIO16
+    inverted: true
+  - id: rgb_blue
+    platform: ledc
+    pin: GPIO17
+    inverted: true
+
+  # Relay output — active LOW because the optoisolated relay board energizes
+  # when the IN pin is pulled LOW. GPIO goes LOW → relay closes → heat call.
+  - platform: gpio
+    pin:
+      number: GPIO22
+      inverted: true
+    id: heat_relay_output
+
+# ----------------------------------------------------------------------------
+# Lights — backlight dimmer and RGB status LED
+# RGB is used to show heat state at a glance: red=heating, blue=idle, off=off
+# ----------------------------------------------------------------------------
+light:
+  - id: backlight
+    platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    restore_mode: ALWAYS_ON
+    default_transition_length: 250ms
+
+  - id: status_led
+    platform: rgb
+    red: rgb_red
+    green: rgb_green
+    blue: rgb_blue
+    name: "Status LED"
+    restore_mode: ALWAYS_OFF
+    internal: false
+
+# ----------------------------------------------------------------------------
+# Heat relay switch
+# ----------------------------------------------------------------------------
+switch:
+  - platform: output
+    name: "Zone 1 Heat Call"
+    id: heat_relay
+    output: heat_relay_output
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      # Flash RGB LED red when heat call goes active
+      - light.turn_on:
+          id: status_led
+          red: 100%
+          green: 0%
+          blue: 0%
+          brightness: 50%
+    on_turn_off:
+      - light.turn_off: status_led
+
+# ----------------------------------------------------------------------------
+# Display — ILI9341 in portrait orientation, using the tft_spi bus
+# Strapping pins 15 (CS) and 2 (DC) require the ignore_strapping_warning flag
+# ----------------------------------------------------------------------------
+display:
+  - id: main_display
+    platform: ili9xxx
+    model: ILI9341
+    spi_id: tft_spi
+    cs_pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    invert_colors: false
+    rotation: 0    # 0=portrait, USB port at bottom
+    update_interval: 500ms
+    auto_clear_enabled: false
+    lambda: |-
+      // --- State derivation ---
+      auto mode = id(zone1_thermostat).mode;
+      auto action = id(zone1_thermostat).action;
+      bool is_heating = (action == CLIMATE_ACTION_HEATING);
+      bool is_off = (mode == CLIMATE_MODE_OFF);
+
+      // --- Background tint by state ---
+      Color bg = Color(0x1a, 0x1a, 0x1a);      // default dark gray
+      if (!is_off) {
+        bg = is_heating ? Color(0x40, 0x12, 0x0c)   // warm red-brown for heating
+                        : Color(0x0c, 0x25, 0x40);  // cool blue for idle
+      }
+      it.fill(bg);
+
+      Color white = Color(0xff, 0xff, 0xff);
+      Color muted = Color(0x90, 0x98, 0xa8);
+      Color accent = Color(0xf5, 0xa6, 0x23);
+      Color button_bg = Color(0x2a, 0x34, 0x44);
+
+      // --- Header ---
+      it.print(12, 10, id(font_small), muted, "ZONE 1");
+      const char* mode_str = "OFF";
+      if (mode == CLIMATE_MODE_HEAT) mode_str = is_heating ? "HEATING" : "IDLE";
+      it.print(228, 10, id(font_small), accent, TextAlign::TOP_RIGHT, mode_str);
+
+      // --- Hero: current temperature ---
+      if (id(room_temp).has_state()) {
+        char temp_str[8];
+        snprintf(temp_str, sizeof(temp_str), "%.1f", id(room_temp).state);
+        it.print(120, 40, id(font_huge), white, TextAlign::TOP_CENTER, temp_str);
+        it.print(120, 120, id(font_small), muted,
+                 TextAlign::TOP_CENTER, "CURRENT °F");
+      } else {
+        it.print(120, 60, id(font_huge), muted, TextAlign::TOP_CENTER, "--.-");
+      }
+
+      // --- Setpoint row with +/- touch buttons ---
+      it.filled_rectangle(10, 160, 60, 60, button_bg);
+      it.print(40, 190, id(font_large), white, TextAlign::CENTER, "-");
+
+      char sp_str[8];
+      snprintf(sp_str, sizeof(sp_str), "%.1f",
+               id(zone1_thermostat).target_temperature);
+      it.print(120, 170, id(font_large), white, TextAlign::TOP_CENTER, sp_str);
+      it.print(120, 210, id(font_small), muted,
+               TextAlign::TOP_CENTER, "SET °F");
+
+      it.filled_rectangle(170, 160, 60, 60, button_bg);
+      it.print(200, 190, id(font_large), white, TextAlign::CENTER, "+");
+
+      // --- Humidity ---
+      if (id(room_humidity).has_state()) {
+        char hum_str[8];
+        snprintf(hum_str, sizeof(hum_str), "%.0f%%", id(room_humidity).state);
+        it.print(120, 240, id(font_medium), muted,
+                 TextAlign::TOP_CENTER, hum_str);
+      }
+
+      // --- Mode toggle strip (bottom) ---
+      it.filled_rectangle(10, 280, 220, 30, button_bg);
+      const char* mode_label = "TAP TO TURN ON";
+      if (mode == CLIMATE_MODE_HEAT) mode_label = "TAP TO TURN OFF";
+      it.print(120, 295, id(font_small), white, TextAlign::CENTER, mode_label);
+
+# ----------------------------------------------------------------------------
+# Touchscreen — XPT2046 on the dedicated touch_spi bus
+# ----------------------------------------------------------------------------
+touchscreen:
+  - platform: xpt2046
+    id: main_touchscreen
+    spi_id: touch_spi
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    update_interval: 50ms
+    threshold: 400
+    calibration:
+      x_min: 280
+      x_max: 3860
+      y_min: 340
+      y_max: 3860
+    transform:
+      mirror_x: true
+    # Uncomment during first calibration to see raw touch values in logs:
+    # on_touch:
+    #   - lambda: |-
+    #       ESP_LOGI("touch", "x=%d y=%d x_raw=%d y_raw=%d",
+    #                touch.x, touch.y, touch.x_raw, touch.y_raw);
+
+# ----------------------------------------------------------------------------
+# Touch zones → actions
+# Coordinates match the filled_rectangle regions in the display lambda above
+# ----------------------------------------------------------------------------
+binary_sensor:
+  - platform: touchscreen
+    name: "Minus Button"
+    internal: true
+    x_min: 10
+    x_max: 70
+    y_min: 160
+    y_max: 220
+    on_click:
+      - number.decrement:
+          id: local_setpoint
+          cycle: false
+
+  - platform: touchscreen
+    name: "Plus Button"
+    internal: true
+    x_min: 170
+    x_max: 230
+    y_min: 160
+    y_max: 220
+    on_click:
+      - number.increment:
+          id: local_setpoint
+          cycle: false
+
+  - platform: touchscreen
+    name: "Mode Toggle"
+    internal: true
+    x_min: 10
+    x_max: 230
+    y_min: 280
+    y_max: 310
+    on_click:
+      - if:
+          condition:
+            lambda: 'return id(zone1_thermostat).mode == CLIMATE_MODE_HEAT;'
+          then:
+            - climate.control:
+                id: zone1_thermostat
+                mode: "OFF"
+          else:
+            - climate.control:
+                id: zone1_thermostat
+                mode: HEAT
+
+# ----------------------------------------------------------------------------
+# Fonts — loaded from Google Fonts, cached locally by ESPHome on first compile
+# ----------------------------------------------------------------------------
+font:
+  - file: "gfonts://Roboto"
+    id: font_huge
+    size: 72
+    glyphs: "0123456789.°F-"
+  - file: "gfonts://Roboto"
+    id: font_large
+    size: 36
+    glyphs: "0123456789.°F+-"
+  - file: "gfonts://Roboto"
+    id: font_medium
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 14
+
+# ----------------------------------------------------------------------------
+# Temperature sensor — DHT22 on the extended connector
+# Move to SHT40 or BME280 via I2C for better accuracy in production build
+# ----------------------------------------------------------------------------
+sensor:
+  - platform: dht
+    pin: GPIO27
+    model: DHT22
+    temperature:
+      name: "Zone 1 Temperature"
+      id: room_temp
+      accuracy_decimals: 1
+      filters:
+        - offset: -0.5   # Calibrate against reference thermometer after install
+        - sliding_window_moving_average:
+            window_size: 5
+            send_every: 1
+    humidity:
+      name: "Zone 1 Humidity"
+      id: room_humidity
+      accuracy_decimals: 0
+    update_interval: 30s
+
+  # Diagnostics
+  - platform: wifi_signal
+    name: "Zone 1 Wi-Fi Signal"
+    update_interval: 120s
+  - platform: uptime
+    name: "Zone 1 Uptime"
+
+  # Ambient light sensor (CYD has one on GPIO34) — bonus, useful for auto-dim
+  - platform: adc
+    pin: GPIO34
+    name: "Zone 1 Ambient Light"
+    update_interval: 60s
+    attenuation: 12db
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+# ----------------------------------------------------------------------------
+# Setpoint number — backs the +/- touch buttons, syncs to climate entity
+# ----------------------------------------------------------------------------
+number:
+  - platform: template
+    name: "Zone 1 Setpoint"
+    id: local_setpoint
+    min_value: 50
+    max_value: 85
+    step: 0.5
+    unit_of_measurement: "°F"
+    optimistic: true
+    restore_value: true
+    initial_value: 68
+    on_value:
+      then:
+        - climate.control:
+            id: zone1_thermostat
+            target_temperature: !lambda "return x;"
+
+# ----------------------------------------------------------------------------
+# The thermostat itself — hydronic-tuned parameters
+# ----------------------------------------------------------------------------
+climate:
+  - platform: thermostat
+    name: "Zone 1 Thermostat"
+    id: zone1_thermostat
+    sensor: room_temp
+
+    default_target_temperature_low: 68°F
+
+    heat_deadband: 0.75
+    heat_overrun: 0.5
+
+    min_heating_off_time: 1800s   # 30 min minimum between heat calls
+    min_heating_run_time: 900s    # 15 min minimum once heat is called
+    min_idle_time: 300s           # 5 min between mode changes
+
+    preset:
+      - name: Home
+        default_target_temperature_low: 68°F
+        mode: HEAT
+      - name: Sleep
+        default_target_temperature_low: 64°F
+        mode: HEAT
+      - name: Away
+        default_target_temperature_low: 58°F
+        mode: HEAT
+
+    heat_action:
+      - switch.turn_on: heat_relay
+    idle_action:
+      - switch.turn_off: heat_relay
+    off_mode:
+      - switch.turn_off: heat_relay
+    heat_mode:
+      - logger.log: "Heat mode engaged"
